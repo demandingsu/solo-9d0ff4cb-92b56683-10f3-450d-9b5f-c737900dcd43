@@ -74,11 +74,24 @@ API_DESCRIPTION = """
 
 生成在一个 `BEGIN IMMEDIATE` 写事务内完成：事务期间其他进程的导入无法提交，
 整份结果必然来自**同一个已提交快照**；任一环节失败即整体回滚，不会留下可见的半份结果。
+
+## 场站号归并（旧号 → 正式号）
+
+电站更名导致预报/实测分散在旧号与正式号名下时，调用 `POST /stations/merge` 提交旧号与正式号：
+
+- 两类历史原始记录（预报、实测）在**单个写事务**内并入正式号：同键同值去重合并，
+  同键异值则整次归并报 409 冲突并回滚，**不留半份更改**。
+- 归并后，两种 CSV 再导入旧号都会按正式号判重；生成新数据集也按正式号取数，
+  不会写入或读取旧号名下的新记录。
+- 归并幂等：同一旧号重复归并到同一正式号直接成功；已归并旧号不能改绑其他正式号；
+  正式号不能是已归并的旧号（禁止链式归并）。
+- 归并前已保存的数据集不受影响：按原参数重试与查询仍读回原快照。
 """
 
 TAGS = [
     {"name": "imports", "description": "CSV 导入（整批原子，同键异值拒收）"},
     {"name": "datasets", "description": "回测样本数据集：生成、幂等重试、查询"},
+    {"name": "stations", "description": "场站号归并：旧号并入正式号"},
     {"name": "meta", "description": "服务信息"},
 ]
 
@@ -102,10 +115,15 @@ app = FastAPI(
 # ---------------------------------------------------------------- 模型
 
 class GenerateParams(BaseModel):
-    station: str = Field(min_length=1, max_length=128, description="场站编号", examples=["ST01"])
+    station: str = Field(min_length=1, max_length=128, description="场站编号（正式号或已归并的旧号均可，内部按正式号取数）", examples=["ST01"])
     start_hour: str = Field(description="起始目标 UTC 小时（整点）", examples=["2026-03-01T00:00:00Z"])
     end_hour: str = Field(description="结束目标 UTC 小时（整点，含）", examples=["2026-03-01T03:00:00Z"])
     lead_hours: int = Field(ge=0, le=24 * 90, description="提前小时数：只采用 目标小时-lead_hours 之前发布的预报", examples=[24])
+
+
+class MergeStationParams(BaseModel):
+    old_station: str = Field(min_length=1, max_length=128, description="待归并的旧场站号", examples=["ST01-OLD"])
+    canonical_station: str = Field(min_length=1, max_length=128, description="归并目标正式场站号（不能是已归并的旧号）", examples=["ST01"])
 
 
 DATASET_ID_PATH = Path(
@@ -130,8 +148,14 @@ def _locked_to_503(exc: sqlite3.OperationalError) -> None:
         })
 
 
-def _import_batch(table: str, fields: list[str], key_fields: list[str], value_field: str, rows: list[dict]):
-    """单事务导入：同键同值跳过，同键异值整批回滚并返回 409。"""
+def _import_batch(table: str, fields: list[str], key_fields: list[str], value_field: str,
+                  rows: list[dict], resolve_station: bool = True):
+    """单事务导入：同键同值跳过，同键异值整批回滚并返回 409。
+
+    ``resolve_station=True`` 时，在同一写事务内把行内场站号解析为正式号
+    （已归并的旧号→正式号），因此两种 CSV 的旧号导入都会按正式号判重，
+    归并后不可能再写入挂在旧号名下的新记录。
+    """
     conn = db.connect(app.state.db_path)
     inserted = skipped = 0
     conflicts = []
@@ -141,6 +165,8 @@ def _import_batch(table: str, fields: list[str], key_fields: list[str], value_fi
         columns = ", ".join(fields)
         placeholders = ", ".join("?" for _ in fields)
         for row in rows:
+            if resolve_station:
+                row["station"] = logic.resolve_station(conn, row["station"])
             key = tuple(row[f] for f in key_fields)
             existing = conn.execute(f"SELECT {value_field} AS v FROM {table} WHERE {where}", key).fetchone()
             if existing is None:
@@ -211,6 +237,8 @@ def root():
             "POST /datasets/{dataset_id}/generate",
             "GET /datasets",
             "GET /datasets/{dataset_id}",
+            "POST /stations/merge",
+            "GET /stations/aliases",
         ],
     }
 
@@ -284,6 +312,87 @@ def import_actuals(
     return {"inserted": inserted, "skipped_duplicates": skipped, "accepted_rows": len(rows)}
 
 
+# ---------------------------------------------------------------- 路由：场站号归并
+
+@app.post(
+    "/stations/merge",
+    tags=["stations"],
+    summary="归并场站号：把旧号历史记录并入正式号",
+    description=(
+        "在单个写事务内把旧号名下的预报与实测原始记录并入正式号。"
+        "同键同值去重合并；同键异值整次归并报 409 并回滚，不留半份更改。"
+        "归并幂等：同号对重复提交直接成功；已归并旧号不得改绑；正式号不能是已归并的旧号。"
+    ),
+    responses={
+        409: {"description": "同键异值冲突、旧号已归并到其他正式号、或正式号身份不合法"},
+        422: {"description": "请求参数非法（空值、旧号与正式号相同）"},
+        503: {"description": "数据库被其他写入占用，可重试"},
+    },
+)
+def merge_station(params: MergeStationParams = Body(
+    openapi_examples={
+        "归并旧号到正式号": {
+            "summary": "把旧号 ST01-OLD 的历史记录并入正式号 ST01",
+            "description": (
+                "旧号与正式号各自存了一部分预报/实测：同键同值的行去重，"
+                "仅一方存在的行迁入正式号；若存在同键异值则整次归并 409 回滚。"
+            ),
+            "value": {"old_station": "ST01-OLD", "canonical_station": "ST01"},
+        },
+        "重复归并（幂等）": {
+            "summary": "同一号对重复提交 → 幂等成功",
+            "description": "重复归并同一旧号到同一正式号，返回 idempotent=true 且不改动任何数据。",
+            "value": {"old_station": "ST01-OLD", "canonical_station": "ST01"},
+        },
+    },
+)):
+    conn = db.connect(app.state.db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = logic.merge_station(conn, params.old_station, params.canonical_station)
+        except logic.StationMergeError as exc:
+            conn.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"message": exc.message, **exc.extra},
+            )
+
+        if logic.MERGE_TEST_HOOK is not None:  # 测试钩子：验证归并事务的串行化，生产为空
+            logic.MERGE_TEST_HOOK()
+
+        _commit(conn)
+        return result
+    except HTTPException:
+        raise
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        _locked_to_503(exc)
+        raise
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/stations/aliases",
+    tags=["stations"],
+    summary="查询场站号归并关系（旧号 → 正式号）",
+)
+def list_station_aliases():
+    conn = db.connect(app.state.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT old_station, canonical_station, created_at "
+            "FROM station_aliases ORDER BY canonical_station, old_station"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------- 路由：数据集
 
 @app.post(
@@ -340,13 +449,21 @@ def generate_dataset(
     try:
         conn.execute("BEGIN IMMEDIATE")
 
+        # 归并后的旧号在同一事务内解析为正式号：新数据集按正式号取数，
+        # 也不可能读到/写入归并后挂在旧号名下的新记录。
+        resolved_station = logic.resolve_station(conn, canon_params["station"])
+        request_params = dict(canon_params)
+        canon_params = {**canon_params, "station": resolved_station}
+
         existing = conn.execute(
             "SELECT params_json, result_json FROM datasets WHERE dataset_id = ?",
             (dataset_id,),
         ).fetchone()
         if existing is not None:
             stored_params = json.loads(existing["params_json"])
-            if stored_params == canon_params:
+            # 原参数（含归并前使用的旧号字面量）与正式号两种形式都算同参数重试，
+            # 读回首次保存的原快照；其余参数差异仍为 409 冲突。
+            if stored_params == request_params or stored_params == canon_params:
                 result = json.loads(existing["result_json"])
                 _commit(conn)
                 result["replayed"] = True

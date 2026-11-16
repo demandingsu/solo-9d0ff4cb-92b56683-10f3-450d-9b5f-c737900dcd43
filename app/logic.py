@@ -13,6 +13,9 @@ CANON_FMT = "%Y-%m-%dT%H:%M:%SZ"
 # 测试专用钩子：在生成事务持有写锁期间被调用，用于验证快照隔离。生产环境保持 None。
 SNAPSHOT_TEST_HOOK: Optional[Callable[[], None]] = None
 
+# 测试专用钩子：在场站归并事务持有写锁期间被调用，用于验证归并与其他写入的串行化。
+MERGE_TEST_HOOK: Optional[Callable[[], None]] = None
+
 # 生成区间上限（约 5 年的小时数），防止误传超大区间。
 MAX_SPAN_HOURS = 24 * 367 * 5
 
@@ -224,8 +227,12 @@ def normalize_generate_params(station: str, start_hour: str, end_hour: str, lead
 def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_hours: int):
     """逐目标小时配对：取发布时间不晚于 目标小时-lead_hours 的最新预报，配上实测。
 
+    ``station`` 可以是正式号或已归并的旧号：旧号会在当前事务内解析为正式号，
+    因此新数据集一律按正式号取数，归并后不会再读到旧号名下的新记录。
+
     调用方必须已处于写事务中（BEGIN IMMEDIATE），保证读到同一已提交快照。
     """
+    station = resolve_station(conn, station)
     start_s, end_s = canon(start_dt), canon(end_dt)
     forecast_rows = conn.execute(
         "SELECT target_hour, issued_at, irradiance FROM forecasts "
@@ -285,3 +292,207 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
         "missing_both": sum(1 for r in rows if r["missing_reason"] == MISSING_BOTH),
     }
     return rows, summary
+
+
+# ---------------------------------------------------------------- 场站号归并
+
+class StationMergeError(ValueError):
+    """归并不满足前置规则或遇到同键异值冲突；调用方应回滚整个事务。
+
+    status_code：409 表示冲突（含旧号/正式号身份冲突、同键异值），422 表示请求参数非法。
+    """
+
+    def __init__(self, message: str, status_code: int = 409, extra: Optional[dict] = None):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.extra = extra or {}
+
+
+def resolve_station(conn, station: str) -> str:
+    """把场站号解析为正式号：已归并的旧号返回其正式号，否则原样返回。
+
+    映射只有单跳（归并时即禁止链式），所以一次查询即可，无需递归。
+    必须在调用方的事务内执行，保证与同一事务内的其他读写看到同一个快照。
+    """
+    row = conn.execute(
+        "SELECT canonical_station FROM station_aliases WHERE old_station = ?",
+        (station,),
+    ).fetchone()
+    return row["canonical_station"] if row is not None else station
+
+
+def merge_station(conn, old_station: str, canonical_station: str) -> dict:
+    """在当前写事务内把 ``old_station`` 的两类历史原始记录并入 ``canonical_station``。
+
+    规则：
+    - 同键同值：删除旧号行（正式号行保留），合并后全库只剩正式号一份。
+    - 同键异值：任何一条冲突都放弃整次归并（抛 :class:`StationMergeError`），
+      调用方回滚后库与归并前完全一致，不留半份更改。
+    - 幂等：同一 (旧号, 正式号) 重复归并直接返回，不重复改数据，也不得改绑其他正式号。
+    - 已归并的旧号不能再作为正式号；正式号本身不能被归并到别的正式号（禁止链式）。
+
+    返回各表的合并计数。调用方负责 BEGIN IMMEDIATE / COMMIT / ROLLBACK。
+    """
+    old_station = (old_station or "").strip()
+    canonical_station = (canonical_station or "").strip()
+    if not old_station or not canonical_station:
+        raise StationMergeError("旧场站号与正式场站号均不能为空", status_code=422)
+    if old_station == canonical_station:
+        raise StationMergeError(
+            f"旧场站号与正式场站号相同（{old_station!r}），无需归并", status_code=422
+        )
+
+    # 幂等：同号对重复归并，原样返回，不改数据、不改绑。
+    existing_alias = conn.execute(
+        "SELECT canonical_station FROM station_aliases WHERE old_station = ?",
+        (old_station,),
+    ).fetchone()
+    if existing_alias is not None:
+        if existing_alias["canonical_station"] == canonical_station:
+            return {
+                "old_station": old_station,
+                "canonical_station": canonical_station,
+                "idempotent": True,
+                "forecast_merged": 0,
+                "forecast_conflicts": 0,
+                "actual_merged": 0,
+                "actual_conflicts": 0,
+            }
+        raise StationMergeError(
+            f"旧场站号 {old_station!r} 已归并到 {existing_alias['canonical_station']!r}，"
+            f"不能改绑到 {canonical_station!r}",
+            extra={
+                "old_station": old_station,
+                "existing_canonical_station": existing_alias["canonical_station"],
+                "requested_canonical_station": canonical_station,
+            },
+        )
+
+    # 禁止链式/身份冲突：
+    # 1) 正式号本身已是某个正式号名下的旧号 → 它已经“退役”，不能再接收归并；
+    # 2) 正式号已被直接归并到别处（同上，由第 1 条覆盖）；
+    # 3) 旧号当前是某个旧号的正式号（canonical_station 列里有记录）→ 不能再当旧号。
+    canon_is_alias = conn.execute(
+        "SELECT canonical_station FROM station_aliases WHERE old_station = ?",
+        (canonical_station,),
+    ).fetchone()
+    if canon_is_alias is not None:
+        raise StationMergeError(
+            f"正式场站号 {canonical_station!r} 本身是已归并的旧号"
+            f"（现指向 {canon_is_alias['canonical_station']!r}），不能作为归并目标",
+            extra={
+                "canonical_station": canonical_station,
+                "resolves_to": canon_is_alias["canonical_station"],
+            },
+        )
+    canon_targets = [
+        r["old_station"]
+        for r in conn.execute(
+            "SELECT old_station FROM station_aliases WHERE canonical_station = ?",
+            (old_station,),
+        ).fetchall()
+    ]
+    if canon_targets:
+        raise StationMergeError(
+            f"旧场站号 {old_station!r} 当前是已登记正式号（已归并旧号："
+            f"{', '.join(canon_targets)}），不能再作为旧号被归并",
+            extra={"old_station": old_station, "aliased_stations": canon_targets},
+        )
+
+    conflicts: list[dict] = []
+
+    # ---- 预报：键 (target_hour, issued_at)，值 irradiance
+    old_forecasts = conn.execute(
+        "SELECT target_hour, issued_at, irradiance FROM forecasts WHERE station = ? "
+        "ORDER BY target_hour, issued_at",
+        (old_station,),
+    ).fetchall()
+    forecast_kept = 0  # 正式号下不存在同键 → 迁入正式号
+    forecast_dedup = 0  # 同键同值 → 删旧留新
+    forecast_to_insert: list[tuple] = []
+    for r in old_forecasts:
+        canon_row = conn.execute(
+            "SELECT irradiance AS v FROM forecasts "
+            "WHERE station = ? AND target_hour = ? AND issued_at = ?",
+            (canonical_station, r["target_hour"], r["issued_at"]),
+        ).fetchone()
+        if canon_row is None:
+            forecast_kept += 1
+            forecast_to_insert.append(
+                (canonical_station, r["target_hour"], r["issued_at"], r["irradiance"])
+            )
+        elif canon_row["v"] != r["irradiance"]:
+            conflicts.append({
+                "source": "forecasts",
+                "key": {"station": old_station, "target_hour": r["target_hour"],
+                        "issued_at": r["issued_at"]},
+                "old_value": r["irradiance"],
+                "canonical_value": canon_row["v"],
+            })
+        else:
+            forecast_dedup += 1
+
+    # ---- 实测：键 (target_hour)，值 energy
+    old_actuals = conn.execute(
+        "SELECT target_hour, energy FROM actuals WHERE station = ? ORDER BY target_hour",
+        (old_station,),
+    ).fetchall()
+    actual_kept = 0
+    actual_dedup = 0
+    actual_to_insert: list[tuple] = []
+    for r in old_actuals:
+        canon_row = conn.execute(
+            "SELECT energy AS v FROM actuals WHERE station = ? AND target_hour = ?",
+            (canonical_station, r["target_hour"]),
+        ).fetchone()
+        if canon_row is None:
+            actual_kept += 1
+            actual_to_insert.append((canonical_station, r["target_hour"], r["energy"]))
+        elif canon_row["v"] != r["energy"]:
+            conflicts.append({
+                "source": "actuals",
+                "key": {"station": old_station, "target_hour": r["target_hour"]},
+                "old_value": r["energy"],
+                "canonical_value": canon_row["v"],
+            })
+        else:
+            actual_dedup += 1
+
+    if conflicts:
+        # 尚未做任何写入；调用方回滚即可，库保持归并前状态。
+        raise StationMergeError(
+            "归并发现同键异值冲突，整次归并已取消（未写入任何更改）",
+            extra={"conflicts": conflicts},
+        )
+
+    # ---- 全部为同键同值或互补，执行合并：先迁入缺失行，再删除旧号全部行
+    conn.executemany(
+        "INSERT INTO forecasts (station, target_hour, issued_at, irradiance) "
+        "VALUES (?, ?, ?, ?)",
+        forecast_to_insert,
+    )
+    conn.execute("DELETE FROM forecasts WHERE station = ?", (old_station,))
+
+    conn.executemany(
+        "INSERT INTO actuals (station, target_hour, energy) VALUES (?, ?, ?)",
+        actual_to_insert,
+    )
+    conn.execute("DELETE FROM actuals WHERE station = ?", (old_station,))
+
+    conn.execute(
+        "INSERT INTO station_aliases (old_station, canonical_station, created_at) VALUES (?, ?, ?)",
+        (old_station, canonical_station, canon(datetime.now(timezone.utc))),
+    )
+
+    return {
+        "old_station": old_station,
+        "canonical_station": canonical_station,
+        "idempotent": False,
+        "forecast_merged": forecast_kept,
+        "forecast_deduplicated": forecast_dedup,
+        "forecast_conflicts": 0,
+        "actual_merged": actual_kept,
+        "actual_deduplicated": actual_dedup,
+        "actual_conflicts": 0,
+    }

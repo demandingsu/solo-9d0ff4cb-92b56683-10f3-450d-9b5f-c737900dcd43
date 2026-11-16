@@ -30,6 +30,14 @@ CREATE TABLE IF NOT EXISTS actuals (
     PRIMARY KEY (station, target_hour)
 );
 
+CREATE TABLE IF NOT EXISTS station_aliases (
+    old_station       TEXT PRIMARY KEY,  -- 归并前的旧场站号
+    canonical_station TEXT NOT NULL,     -- 归并目标正式号（单跳映射，不允许链式）
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_station_aliases_canonical
+    ON station_aliases (canonical_station);
+
 CREATE TABLE IF NOT EXISTS datasets (
     dataset_id  TEXT PRIMARY KEY,
     params_json TEXT NOT NULL,   -- 规范化后的生成参数（用于同号重试/冲突判定）
